@@ -7,10 +7,24 @@
 
 class Matcher {
 public:
-    Matcher(const std::string& pattern) {
+    enum class Type {
+        Like,
+        Similar
+    };
+
+    Matcher(Type type, const std::string& pattern, bool* status) {
         Compiler c(pattern);
-        //nfa_ = c.CompileForLike();
-        nfa_ = c.CompileForSimilar();
+        switch (type) {
+            case Type::Like:
+                *status = c.CompileForLike(&nfa_);
+                break;
+            case Type::Similar:
+                *status = c.CompileForSimilar(&nfa_);
+                break;
+            default:
+                *status = false;
+                break;
+        }
     }
 
     bool Match(const std::string& str) {
@@ -44,104 +58,148 @@ private:
     struct NfaState {
     public:
         NfaState(bool is_end): is_end(is_end) {}
+        NfaState(bool is_end, std::unordered_map<char, std::shared_ptr<NfaState>> st, std::vector<std::shared_ptr<NfaState>> et):
+            is_end(is_end), symbol_transition(st), epsilon_transitions(et) {}
     public:
         bool is_end;
-        std::unordered_map<char, std::shared_ptr<NfaState>> symbol_transition; //could replace this with an std::pair
+        std::unordered_map<char, std::shared_ptr<NfaState>> symbol_transition;
         std::vector<std::shared_ptr<NfaState>> epsilon_transitions;
     };
 
     struct Nfa {
         std::shared_ptr<NfaState> start;
         std::shared_ptr<NfaState> end;
+
+        std::shared_ptr<NfaState> AddState(std::shared_ptr<NfaState> ptr, std::unordered_map<std::shared_ptr<NfaState>, std::shared_ptr<NfaState>>& map) {
+            if (map.find(ptr) != map.end())
+                return map.at(ptr);
+
+            std::shared_ptr<NfaState> clone = std::make_shared<NfaState>(ptr->is_end);
+
+            map.insert({ ptr, clone });
+            for (const std::pair<char, std::shared_ptr<NfaState>>& p: ptr->symbol_transition) {
+                std::shared_ptr<NfaState> child = AddState(p.second, map);
+                clone->symbol_transition.insert({ p.first, child });
+            }
+            for (std::shared_ptr<NfaState> p: ptr->epsilon_transitions) {
+                std::shared_ptr<NfaState> child = AddState(p, map);
+                clone->epsilon_transitions.push_back(child);
+            }
+
+            return clone;
+        }
+        Nfa Clone() {
+            std::unordered_map<std::shared_ptr<NfaState>, std::shared_ptr<NfaState>> map;
+            std::shared_ptr<NfaState> cloned_start = AddState(start, map);
+            return { cloned_start, map.at(end) };
+        }
     };
 
     class Compiler {
     public:
         Compiler(const std::string& pattern): pattern_(pattern) {}
-        Nfa CompileForLike() {
-            Nfa root = CompileLikeBase();
+        bool CompileForLike(Nfa* nfa) {
+            if (!CompileLikeBase(nfa))
+                return false;
             while (!AtEnd()) {
-                root = MakeConcat(root, CompileLikeBase());
+                Nfa other;
+                if (!CompileLikeBase(&other))
+                    return false;
+                *nfa = MakeConcat(*nfa, other);
             }
-            return root;
+            return true;
         }
-        Nfa CompileForSimilar() {
-            Nfa root = CompileAlternation();
+        bool CompileForSimilar(Nfa* nfa) {
+            if (!CompileAlternation(nfa))
+                return false;
             while (!AtEnd()) {
-                root = MakeConcat(root, CompileAlternation());
+                Nfa other;
+                if (!CompileAlternation(&other))
+                    return false;
+                *nfa = MakeConcat(*nfa, other);
             }
-            return root;
+            return true;
         }
     private:
         //functions for 'like' matching
-        Nfa CompileLikeBase() {
+        bool CompileLikeBase(Nfa* nfa) {
             char c = NextChar();
             switch (c) {
-                case '%':   return MakeClosure(MakeSymbol('_'));
-                case '_':   return MakeSymbol('_');
-                default:    return MakeSymbol(c);
+                case '%':   *nfa = MakeClosure(MakeSymbol('_')); return true;
+                case '_':   *nfa = MakeSymbol('_'); return true;
+                default:    *nfa = MakeSymbol(c); return true;
             }
         }
 
         //functions for 'similar to' matching
-        Nfa CompileAlternation() {
-            Nfa left = CompileConcat();
+        bool CompileAlternation(Nfa* nfa) {
+            if (!CompileConcat(nfa))
+                return false;
             while (PeekChar('|')) {
                 NextChar();
-                left = MakeUnion(left, CompileConcat());
+                Nfa other;
+                if (!CompileConcat(&other))
+                    return false;
+                *nfa = MakeUnion(*nfa, other);
             }
-            return left;
+            return true;
         }
-        Nfa CompileConcat() {
-            Nfa left = CompileDuplication();
+        bool CompileConcat(Nfa* nfa) {
+            if (!CompileDuplication(nfa))
+                return false;
             while (!AtEnd() && !PeekMetaChar()) {
-                left = MakeConcat(left, CompileDuplication());
+                Nfa other;
+                if (!CompileDuplication(&other))
+                    return false;
+                *nfa = MakeConcat(*nfa, other);
             }
-            return left;
+            return true;
         }
-        Nfa CompileDuplication() {
-            Nfa left = CompileAtomic();
+        bool CompileDuplication(Nfa* nfa) {
+            if (!CompileAtomic(nfa))
+                return false;
             while (PeekDupChar()) {
                 char next = NextChar();
                 switch (next) {
                     case '*':
-                        left = MakeClosure(left);
+                        *nfa = MakeClosure(*nfa);
                         break;
                     case '+':
-                        left = MakeOneOrMore(left);
+                        *nfa = MakeOneOrMore(*nfa);
                         break;
                     case '?':
-                        left = MakeZeroOrOne(left);
+                        *nfa = MakeZeroOrOne(*nfa);
                         break;
                     case '{': {
-                        int m = ParseInt();
+                        int m;
+                        if (!ParseInt(&m)) return false;
+
                         if (PeekChar('}')) {
-                            NextChar(); //} 
-                            left = MakeExactlyM(left, m);
+                            *nfa = MakeExactlyM(*nfa, m);
                         } else if (PeekChar(',')) {
                             NextChar(); //,
                             if (PeekChar('}')) {
-                                NextChar(); //}
-                                left = MakeMOrMore(left, m);
+                                *nfa = MakeMOrMore(*nfa, m);
                             } else { //next is integer
-                                int n = ParseInt();
-                                NextChar(); //}
-                                left = MakeMToN(left, m, n);
+                                int n;
+                                if (!ParseInt(&n)) return false;
+                                *nfa = MakeMToN(*nfa, m, n);
                             }
                         }
+                        if (!EatChar('}')) return false;
                         break;
                     }
                     default:
-                        std::cout << "Operator not implemented\n";
+                        return false;
                         break;
                 }
             }
-            return left;
+            return true;
         }
-        Nfa CompileAtomic() {
-            char next = NextChar();
-            switch (next) {
+        bool CompileAtomic(Nfa* nfa) {
+            switch (PeekChar()) {
                 case '(': {
+                    NextChar();
                     size_t start = idx_;
                     while (!PeekChar(')')) {
                         NextChar();
@@ -149,11 +207,21 @@ private:
                     size_t end = idx_;
                     NextChar();
                     Compiler c(pattern_.substr(start, end - start));
-                    return c.CompileForSimilar();
+                    return c.CompileForSimilar(nfa);
                 }
-                case '%':   return MakeClosure(MakeSymbol('_'));
-                case '_':   return MakeSymbol('_');
-                default:    return MakeSymbol(next);
+                case '%': {
+                    NextChar();
+                    *nfa = MakeClosure(MakeSymbol('_')); return true;
+                }
+                case '_': {
+                    NextChar();
+                    *nfa = MakeSymbol('_'); return true;
+                }
+                default: {
+                    if (PeekDupChar() || PeekChar('|'))
+                        return false;
+                    *nfa = MakeSymbol(NextChar()); return true;
+                }
             }  
         }
         bool PeekMetaChar() {
@@ -179,15 +247,24 @@ private:
         char PeekChar() {
             return pattern_.at(idx_);
         }
+        bool EatChar(char c) {
+            return NextChar() == c;
+        }
         char NextChar() {
             return pattern_.at(idx_++);
         }
-        int ParseInt() {
+        bool ParseInt(int* result) {
             size_t start = idx_;
             while (!AtEnd() && IsNumeric(PeekChar())) {
                 NextChar();
             }
-            return std::stoi(pattern_.substr(start, idx_ - start));
+
+            std::string num = pattern_.substr(start, idx_ - start);
+            std::cout << num << ": " << num.size() << std::endl;
+            if (num.size() == 0) return false;
+
+            *result = std::stoi(num);
+            return true;
         }
         bool IsNumeric(char c) {
             return '0' <= c && c <= '9';
@@ -206,12 +283,13 @@ private:
         }
 
         //TODO: look at this - not really used in the way we are compiling right now
+        /*
         Nfa MakeEpsilon() {
             std::shared_ptr<NfaState> start = std::make_shared<NfaState>(false);
             std::shared_ptr<NfaState> end = std::make_shared<NfaState>(true);
             AddEpsilonTransition(start, end);
             return { start, end };
-        }
+        }*/
 
         Nfa MakeSymbol(char symbol) {
             std::shared_ptr<NfaState> start = std::make_shared<NfaState>(false);
@@ -250,7 +328,7 @@ private:
             return { start, end };
         }
         Nfa MakeOneOrMore(Nfa nfa) {
-            return MakeConcat(nfa, MakeClosure(nfa));
+            return MakeConcat(nfa.Clone(), MakeClosure(nfa.Clone()));
         }
         Nfa MakeZeroOrOne(Nfa nfa) {
             std::shared_ptr<NfaState> start = std::make_shared<NfaState>(false);
@@ -264,22 +342,22 @@ private:
             return { start, end };
         }
         Nfa MakeExactlyM(Nfa nfa, int m) {
-            Nfa result = nfa;
+            Nfa result = nfa.Clone();
 
             for (int i = 0; i < m - 1; i++) {
-                result = MakeConcat(result, nfa);
+                result = MakeConcat(result, nfa.Clone());
             }
 
             return result;
         }
         Nfa MakeMOrMore(Nfa nfa, int m) {
-            return MakeConcat(MakeExactlyM(nfa, m), MakeClosure(nfa));
+            return MakeConcat(MakeExactlyM(nfa.Clone(), m), MakeClosure(nfa.Clone()));
         }
         Nfa MakeMToN(Nfa nfa, int m, int n) {
-            Nfa result = MakeExactlyM(nfa, m);
+            Nfa result = MakeExactlyM(nfa.Clone(), m);
 
             for (int i = 0; i < n - m; i++) {
-                result = MakeConcat(result, MakeZeroOrOne(nfa)); 
+                result = MakeConcat(result, MakeZeroOrOne(nfa.Clone())); 
             }
 
             return result;
@@ -314,8 +392,31 @@ int main() {
     std::cout << m.Match("zab") << std::endl;
     std::cout << m.Match("caaaaaaab") << std::endl;
     std::cout << m.Match("cabaaaa") << std::endl;*/
-    Matcher m("a{2}");
-    std::cout << m.Match("a") << std::endl;
-    std::cout << m.Match("aa") << std::endl;
-    std::cout << m.Match("aaa") << std::endl;
+    /*
+    Matcher m("(ab){3}");
+    std::cout << m.Match("abababab") << std::endl;
+    std::cout << m.Match("ab") << std::endl;
+    std::cout << m.Match("ababab") << std::endl;*/
+    
+    bool status;
+    {
+        Matcher m(Matcher::Type::Similar, "abc", &status);
+        std::cout << m.Match("abc") << std::endl;
+    }
+    {
+        Matcher m(Matcher::Type::Similar, "a", &status);
+        std::cout << m.Match("abc") << std::endl;
+    }
+    {
+        Matcher m(Matcher::Type::Similar, "%(b|d)%", &status);
+        std::cout << m.Match("abc") << std::endl;
+    }
+    {
+        Matcher m(Matcher::Type::Similar, "(b|c)%", &status);
+        std::cout << m.Match("abc") << std::endl;
+    }
+    {
+        Matcher m(Matcher::Type::Like, "a|b%", &status);
+        std::cout << m.Match("a|baaa") << std::endl;
+    }
 }
